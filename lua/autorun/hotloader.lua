@@ -220,6 +220,68 @@ function TBH.IsValidWSID(wsid)
     return string_match(wsid, "^%d+$") ~= nil
 end
 
+--------------------------------------------------------------------------------
+-- Supported GAME MODES (and only these): TTT, DarkRP, Prop Hunt, Fazbear Hunt
+--
+-- Garry's Mod can only change game mode by restarting the map (the game mode is read when a
+-- level loads), so "hotloading" one means: mount the addon, then switch to it with a map restart.
+-- `match` = Lua patterns for the folder name under gamemodes/ ; `mapPrefix` = maps the mode needs.
+--------------------------------------------------------------------------------
+TBH.Gamemodes = {
+    { key = "ttt",      name = "Trouble in Terrorist Town", match = { "^terrortown$", "^ttt" },        mapPrefix = "ttt_" },
+    { key = "darkrp",   name = "DarkRP",                    match = { "^darkrp" },                     mapPrefix = "rp_" },
+    { key = "prophunt", name = "Prop Hunt",                 match = { "^prop_?hunt", "^ph$" },         mapPrefix = "" },
+    { key = "fazbear",  name = "Fazbear Hunt",              match = { "^fazbear" },                    mapPrefix = "" },
+}
+
+TBH.GamemodeByKey = {}
+for _, gm in ipairs(TBH.Gamemodes) do TBH.GamemodeByKey[gm.key] = gm end
+
+-- What game mode is running right now? Used for the "this is not Sandbox" safeguards: the Hotloader
+-- was built for Sandbox. Every other game mode may have no Q menu (so no Hotloader tabs) and may not
+-- know about hotloaded weapons / entities / tools.
+function TBH.GetGamemodeInfo()
+    local folder = string.lower(tostring(engine.ActiveGamemode() or ""))
+    local gm = istable(GAMEMODE) and GAMEMODE or {}
+    local known = TBH.MatchGamemode(folder)
+
+    return {
+        folder = folder,
+        name = (known and known.name) or tostring(gm.Name or folder),
+        known = known,
+        pureSandbox = folder == "sandbox",
+        sandboxBased = folder == "sandbox" or gm.IsSandboxDerived == true, -- has a Q menu
+    }
+end
+
+-- the sentence shown to the player (nil on plain Sandbox: nothing to warn about)
+function TBH.GamemodeNotice(info)
+    if info.pureSandbox then return nil end
+
+    local who = info.name .. " (" .. info.folder .. ")"
+
+    if info.sandboxBased then
+        return "Game mode: " .. who .. " - based on Sandbox. Its Q menu can be limited; if the Hotloader tabs are missing, type hotloader_menu in the console."
+    end
+
+    return "Game mode: " .. who .. " - NOT Sandbox. It has no Q menu, so the Hotloader tabs are not there: type hotloader_menu in the console "
+        .. "(or bind a key: bind F6 hotloader_menu). Hotloaded weapons, entities and tools only work if this game mode supports them."
+end
+
+-- returns the supported game mode a gamemodes/<folder> name belongs to (or nil)
+function TBH.MatchGamemode(folder)
+    if not isstring(folder) then return nil end
+    folder = string.lower(folder)
+
+    for _, gm in ipairs(TBH.Gamemodes) do
+        for _, pattern in ipairs(gm.match) do
+            if string_match(folder, pattern) then return gm end
+        end
+    end
+
+    return nil
+end
+
 -- Extracts a workshop id from a raw id, a full workshop URL, or junk text
 function TBH.ExtractWSID(input)
     if input == nil then return nil end
@@ -648,6 +710,14 @@ if CLIENT then
                 return
             end
 
+            -- SAFEGUARD: game modes that are not based on Sandbox (TTT, Prop Hunt, ...) have no Q
+            -- menu at all - there is nothing to rebuild, and the reload is the risky part
+            local gmInfo = TBH.GetGamemodeInfo()
+            if not gmInfo.sandboxBased and not IsValid(g_SpawnMenu) then
+                TBH.Diag("spawnmenu_reload SKIPPED - " .. gmInfo.name .. " has no Q menu (use hotloader_menu)")
+                return
+            end
+
             TBH.Diag("spawnmenu_reload EXECUTING (menu rebuild - classic CEF crash point)")
             TBH.RepairTabsAfterReload = true
             RunConsoleCommand("spawnmenu_reload")
@@ -766,6 +836,15 @@ if SERVER then
         end
 
         TBH.ModuleRequired = not TBH.ServerCanUGC -- remember that we tried and failed
+    end
+
+    -- SINGLEPLAYER: the "server" and the "client" are ONE process sharing ONE filesystem.
+    -- With gmsv_workshop installed the server used to download + MountGMA the addon and then
+    -- ask the host client to mount the very same .gma again - mounting one archive twice in one
+    -- process hard-crashes the game. In singleplayer the player's own game now does the single
+    -- download + mount, and the server only initializes the Lua (the listen-host route).
+    if game.SinglePlayer() then
+        TBH.ServerCanUGC = false
     end
 
     TBH.ServerCanFileInfo = (steamworks ~= nil and isfunction(steamworks.FileInfo))
@@ -897,7 +976,7 @@ do
         return "TBH." .. tostring(self.ID) .. "." .. event .. "." .. tostring(identifier)
     end
 
-    function Bundle:AddHook(event, identifier, callback)
+    function Bundle:AddHook(event, identifier, callback, priority)
         local ev = self.Hooks[event]
         if not ev then
             ev = {}
@@ -935,7 +1014,14 @@ do
             end
         end
 
-        hook.Add(event, gid, registered)
+        -- forward the priority (HOOK_HIGH etc.) instead of silently dropping it - frameworks
+        -- like ULib register chat-command hooks at HOOK_HIGH so they see chat before
+        -- the gamemode does; dropping that broke nothing outright but changed behavior
+        if priority ~= nil then
+            hook.Add(event, gid, registered, priority)
+        else
+            hook.Add(event, gid, registered)
+        end
     end
 
     function Bundle:RemoveHook(event, identifier)
@@ -990,11 +1076,11 @@ do
         ----------------------------------------------------------------
         local hookSandbox = setmetatable({}, { __index = hook })
 
-        function hookSandbox.Add(event, identifier, callback, ...)
+        function hookSandbox.Add(event, identifier, callback, priority)
             if not isstring(event) or identifier == nil then return end
             if callback == nil then return bundle:RemoveHook(event, identifier) end
             if not isfunction(callback) then return end
-            bundle:AddHook(event, identifier, callback)
+            bundle:AddHook(event, identifier, callback, priority)
         end
 
         function hookSandbox.Remove(event, identifier, ...)
@@ -3046,15 +3132,67 @@ function TBH.GetRequiredAddons(wsid, callback, required, pending)
     end
 
     http.Fetch("https://steamcommunity.com/sharedfiles/filedetails/?id=" .. wsid, function(body)
-        for id in string_gmatch(body, '<a href="https://steamcommunity%.com/workshop/filedetails/%?id=(%d+)" target="_blank">') do
-            if not required[id] and table.Count(required) < 64 then
-                required[id] = true
-                TBH.GetRequiredAddons(id, callback, required, pending)
+        body = isstring(body) and body or ""
+
+        local found = {}
+        local nScrape = 0
+
+        local function Add(id)
+            if not found[id] then
+                found[id] = true
+                nScrape = nScrape + 1
             end
         end
 
-        pending[wsid] = nil
-        CheckDone()
+        -- 1) the exact markup of a "Required Items" link
+        for id in string_gmatch(body, '<a href="https://steamcommunity%.com/workshop/filedetails/%?id=(%d+)" target="_blank">') do
+            Add(id)
+        end
+
+        -- 2) a looser form (other host / extra attributes): a link wrapping a requiredItem box
+        for id in string_gmatch(body, '<a[^>]-href="[^"]-filedetails/%?id=(%d+)"[^>]->%s*<div class="requiredItem"') do
+            Add(id)
+        end
+
+        -- 3) the Required Items container itself, whatever its links look like
+        local startPos = string.find(body, 'id="RequiredItems"', 1, true)
+            or string.find(body, 'class="requiredItemsContainer"', 1, true)
+
+        if startPos then
+            local block = string.sub(body, startPos, startPos + 4000)
+            local stop = string.find(block, '<div class="detailBox', 20, true)
+                or string.find(block, '<div class="rightDetailsBlock', 20, true)
+                or string.find(block, "<script", 20, true)
+            if stop then block = string.sub(block, 1, stop) end
+
+            for id in string_gmatch(block, "filedetails/%?id=(%d+)") do
+                Add(id)
+            end
+        end
+
+        TBH.Diag("[server] required items page scrape for " .. tostring(wsid) .. ": " .. #body .. " bytes, RequiredItems block "
+            .. (startPos and "FOUND" or "not found") .. ", " .. nScrape .. " id(s)")
+
+        -- 4) ask the Steam API as well (more dependable than markup) and merge both
+        local function Finish(apiIds)
+            for _, id in ipairs(apiIds or {}) do found[id] = true end
+
+            for id in pairs(found) do
+                if id ~= tostring(wsid) and not required[id] and table.Count(required) < 64 then
+                    required[id] = true
+                    TBH.GetRequiredAddons(id, callback, required, pending)
+                end
+            end
+
+            pending[wsid] = nil
+            CheckDone()
+        end
+
+        if isfunction(TBH.GetRequiredViaAPI) then
+            TBH.GetRequiredViaAPI(wsid, Finish)
+        else
+            Finish({})
+        end
     end, function()
         pending[wsid] = nil
         CheckDone()
@@ -3453,6 +3591,56 @@ if SERVER then
                 StatusTo(requester, "Hotload of \"" .. title .. "\" crashed during initialization (see server console)", 2)
             end
 
+            -- singleplayer: server init is finished - NOW the host client may run its own init
+            -- (the two inits used to run on top of each other inside the same process)
+            if skipHost and game.SinglePlayer() then
+                local host = FindHostPlayer()
+
+                if IsValid(host) then
+                    TBH.Diag("[server] singleplayer: server init done - telling the client to run its init")
+                    TBH.Net:Start("hostgo")
+                    net.WriteString(wsid)
+                    net.Send(host)
+                end
+            end
+
+            -- SAFEGUARD: hotloading into something that is not Sandbox - tell the player once
+            if not quiet and IsValid(requester) and not TBH.Server.GamemodeNoted then
+                local gmInfo = TBH.GetGamemodeInfo()
+
+                if not gmInfo.pureSandbox then
+                    TBH.Server.GamemodeNoted = true
+                    StatusTo(requester, "Note: the active game mode is " .. gmInfo.name .. " (not Sandbox) - hotloaded weapons, entities and tools only work if it supports them. No Q menu? Use hotloader_menu.", 3)
+                end
+            end
+
+            -- the addon contains a supported game mode (TTT / DarkRP / Prop Hunt / Fazbear Hunt)?
+            -- offer to switch to it (needs a map restart, so it is never done without asking)
+            if not quiet and IsValid(requester) and istable(files) then
+                local seen = {}
+
+                for i = 1, #files do
+                    local folder = string_match(string.lower(tostring(files[i])), "^gamemodes/([^/]+)/")
+
+                    if folder and not seen[folder] then
+                        seen[folder] = true
+
+                        local gm = TBH.MatchGamemode(folder)
+                        if gm then
+                            TBH.Diag("[server] game mode found in the addon: " .. folder .. " (" .. gm.name .. ")")
+
+                            TBH.Net:Start("gmfound")
+                            net.WriteString(folder)
+                            net.WriteString(gm.key)
+                            net.WriteString(gm.name)
+                            net.WriteString(string_sub(tostring(title or ""), 1, 100))
+                            net.Send(requester)
+                            break
+                        end
+                    end
+                end
+            end
+
             -- release the queue slot and advance the pipeline
             timer.Remove("TBH.AdvanceGuard." .. wsid)
 
@@ -3824,6 +4012,137 @@ if SERVER then
     end
 
     --------------------------------------------------------------------
+    -- SINGLEPLAYER collection hotloading
+    --
+    -- No server-side downloader here, so the collection is hotloaded the
+    -- same way a single addon is (through the host player's game) - but
+    -- strictly ONE member at a time: download+mount -> server init ->
+    -- client init -> short settle -> next member.
+    --------------------------------------------------------------------
+
+    local function SPBroadcastProgress()
+        local batch = TBH.Server.Batch
+
+        TBH.Net:Start("batchprog")
+        net.WriteUInt(math.Clamp(batch.done or 0, 0, 255), 8)
+        net.WriteUInt(math.Clamp(batch.total or 0, 0, 255), 8)
+        net.WriteString(string_sub(batch.title or "collection", 1, 100))
+        net.Broadcast()
+    end
+
+    local function SPBatchFinish()
+        local batch = TBH.Server.Batch
+        TBH.Server.SP = nil
+
+        if batch and batch.total and batch.total > 0 then
+            TBH.Diag("[server] singleplayer collection batch COMPLETE: " .. (batch.done or 0) .. "/" .. batch.total)
+
+            TBH.Server.Batch = { title = nil, total = 0, done = 0 }
+
+            TBH.Net:Start("batchend")
+            net.WriteUInt(math.Clamp(batch.total, 0, 255), 8)
+            net.WriteString(string_sub(batch.title or "collection", 1, 100))
+            net.Broadcast()
+
+            TBH.Msg("Collection batch complete: " .. (batch.done or 0) .. "/" .. batch.total .. " addons (" .. tostring(batch.title or "?") .. ")")
+
+            timer.Simple(10, function()
+                TBH.DiagEnd("server batch complete")
+            end)
+        end
+    end
+
+    function TBH.Server.SPBatchNext()
+        local sp = TBH.Server.SP
+        if not sp or sp.current then return end
+
+        sp.idx = sp.idx + 1
+        local m = sp.members[sp.idx]
+
+        if not m then return SPBatchFinish() end
+
+        local host = FindHostPlayer()
+        if not IsValid(host) then
+            TBH.Diag("[server] singleplayer batch: no host player - stopping")
+            return SPBatchFinish()
+        end
+
+        local id = m.wsid
+        sp.current = id
+
+        TBH.Diag("[server] singleplayer batch member " .. sp.idx .. "/" .. #sp.members .. ": '" .. string_sub(tostring(m.title), 1, 50) .. "' (" .. id .. ")")
+
+        sp.currentMember = m
+        TBH.Server.HostPending[id] = { requester = m.requester or sp.requester, spBatch = m.batch == true or nil }
+
+        if not m.batch then
+            StatusTo(m.requester or sp.requester, "Downloading \"" .. tostring(m.title or id) .. "\" through your game (" .. sp.idx .. "/" .. #sp.members .. ")...", 0)
+        end
+
+        -- stall valve: one stuck member must never freeze the whole collection
+        timer.Create("TBH.SPStep." .. id, 600, 1, function()
+            if TBH.Server.SP and TBH.Server.SP.current == id then
+                TBH.Server.HostPending[id] = nil
+                TBH.Server.FailedUntil[id] = CurTime() + 60
+                TBH.Diag("[server] singleplayer batch member " .. id .. " TIMED OUT - skipping it")
+                TBH.Server.SPBatchStepDone(id, false)
+            end
+        end)
+
+        TBH.Net:Start("hostdl")
+        net.WriteString(id)
+        net.WriteString(m.title or "")
+        net.Send(host)
+    end
+
+    -- a member is completely finished (server + client init), or failed
+    function TBH.Server.SPBatchStepDone(id, ok)
+        local sp = TBH.Server.SP
+        if not sp or sp.current ~= id then return end
+
+        timer.Remove("TBH.SPStep." .. id)
+        sp.current = nil
+
+        if not ok and sp.currentMember and sp.currentMember.batch then
+            -- failed collection members still count, otherwise the HUD counter never finishes
+            local batch = TBH.Server.Batch
+            if batch then
+                batch.done = (batch.done or 0) + 1
+                SPBroadcastProgress()
+            end
+        end
+        sp.currentMember = nil
+
+        local settle = math.Clamp(TBH.CVarBatchDelay:GetInt(), 1, 30)
+        timer.Simple(settle, TBH.Server.SPBatchNext)
+    end
+
+    -- Hotload a list of addons through the host player's game, strictly one after another
+    -- (required addons first, the addon you asked for last). If a chain is already running the
+    -- new members are appended to it.
+    function TBH.Server.HostChainAdd(requester, list)
+        local sp = TBH.Server.SP
+
+        if sp then
+            for i = 1, #list do
+                local dupe = false
+
+                for j = (sp.idx or 0) + 1, #sp.members do
+                    if sp.members[j].wsid == list[i].wsid then dupe = true break end
+                end
+
+                if sp.current == list[i].wsid then dupe = true end
+                if not dupe then sp.members[#sp.members + 1] = list[i] end
+            end
+
+            return
+        end
+
+        TBH.Server.SP = { members = list, idx = 0, requester = requester, current = nil }
+        TBH.Server.SPBatchNext()
+    end
+
+    --------------------------------------------------------------------
     -- Steam Web API helpers (v1.1.2)
     --
     -- WHY: the workshop page does not always show its collection markers
@@ -3861,18 +4180,20 @@ if SERVER then
         -- Steam never responds at all.
         TBH.Diag("[server] Steam Web API POST -> " .. endpoint)
 
+        local watchName = "TBH.APIWatchdog." .. tostring(SysTime()) .. "." .. math.random(1, 1000000)
+
         local fired = false
         local function Dispatch(result)
             if fired then return end
             fired = true
-            if timer.Exists("TBH.APIWatchdog") then timer.Remove("TBH.APIWatchdog") end
+            if timer.Exists(watchName) then timer.Remove(watchName) end
             callback(result)
         end
 
         -- v1.1.4 watchdog: if neither success nor failed fires within
         -- 18s, force a dispatch. Without this, a hung HTTP request would
         -- leave the diag log hanging forever (no REFUSED line ever logs).
-        timer.Create("TBH.APIWatchdog", 18, 1, function()
+        timer.Create(watchName, 18, 1, function()
             if not fired then
                 TBH.Diag("[server] Steam API WATCHDOG: no response within 18s - assuming the request hung. Dispatching nil.")
                 Dispatch(nil)
@@ -3944,6 +4265,97 @@ if SERVER then
             TBH.Diag("[server] HTTP() refused to start the request (returned false) - usually means: HTTP is disabled by the server, the URL is on a blocklist, or an SSL/TLS handshake was refused. No callback will fire.")
             Dispatch(nil)
         end
+    end
+
+    -- callback(titles) - titles[wsid] = real workshop title (empty table if the API did not answer)
+    function TBH.GetTitlesViaAPI(ids, callback)
+        local params = { itemcount = tostring(#ids) }
+        for i, id in ipairs(ids) do
+            params["publishedfileids[" .. (i - 1) .. "]"] = tostring(id)
+        end
+
+        SteamAPIRequest(API_FILE_DETAILS, params, function(tbl)
+            local titles = {}
+
+            local items = istable(tbl) and istable(tbl.response) and tbl.response.publishedfiledetails or nil
+            if istable(items) then
+                for _, d in ipairs(items) do
+                    if istable(d) and d.result == 1 and isstring(d.title) and d.title ~= "" and d.publishedfileid ~= nil then
+                        titles[tostring(d.publishedfileid)] = d.title
+                    end
+                end
+            end
+
+            callback(titles)
+        end)
+    end
+
+    -- The Steam API lists an addon's Required Items as the `children` of its file details.
+    -- Used next to the page scrape (TBH.GetRequiredAddons), because the page markup keeps changing.
+    -- callback(ids) - always called, with an empty table when nothing was found.
+    function TBH.GetRequiredViaAPI(wsid, callback)
+        SteamAPIRequest(API_FILE_DETAILS,
+            { itemcount = "1", ["publishedfileids[0]"] = tostring(wsid) },
+            function(tbl)
+                local ids = {}
+
+                local det = istable(tbl) and istable(tbl.response) and istable(tbl.response.publishedfiledetails)
+                    and tbl.response.publishedfiledetails[1] or nil
+
+                if istable(det) and istable(det.children) then
+                    for _, child in ipairs(det.children) do
+                        local id = istable(child) and child.publishedfileid or nil
+
+                        if (isstring(id) or isnumber(id)) and tostring(id) ~= "" then
+                            ids[#ids + 1] = tostring(id)
+                        end
+                    end
+                end
+
+                TBH.Diag("[server] required items of " .. tostring(wsid) .. " via GetPublishedFileDetails: " .. #ids)
+
+                if #ids > 0 then return callback(ids) end
+
+                -- second source: IPublishedFileService can include the children (may need an API key;
+                -- if Steam refuses, this just returns nothing)
+                local done = false
+                local function Out(list)
+                    if done then return end
+                    done = true
+                    callback(list)
+                end
+
+                timer.Simple(16, function() Out({}) end)
+
+                local started = HTTP({
+                    method = "GET",
+                    url = "https://api.steampowered.com/IPublishedFileService/GetDetails/v1/",
+                    parameters = { ["publishedfileids[0]"] = tostring(wsid), includechildren = "true" },
+                    timeout = 15,
+                    success = function(code, body)
+                        local list = {}
+                        local t = isstring(body) and util.JSONToTable(body) or nil
+                        local d = istable(t) and istable(t.response) and istable(t.response.publishedfiledetails)
+                            and t.response.publishedfiledetails[1] or nil
+
+                        if istable(d) and istable(d.children) then
+                            for _, child in ipairs(d.children) do
+                                local cid = istable(child) and child.publishedfileid or nil
+                                if cid ~= nil and tostring(cid) ~= "" then list[#list + 1] = tostring(cid) end
+                            end
+                        end
+
+                        TBH.Diag("[server] required items of " .. tostring(wsid) .. " via IPublishedFileService: HTTP " .. tostring(code) .. ", " .. #list)
+                        Out(list)
+                    end,
+                    failed = function(err)
+                        TBH.Diag("[server] IPublishedFileService required items request failed: " .. tostring(err))
+                        Out({})
+                    end,
+                })
+
+                if started == false then Out({}) end
+            end)
     end
 
     -- callback(file_type, title, details) - file_type nil = API unreachable/unknown.
@@ -4175,6 +4587,22 @@ if SERVER then
         -- every member. (Neither WSHL nor DTOybox can do this.)
         --------------------------------------------------------------------
 
+        -- Required items: the player's game reads them from the REAL workshop page (a hidden browser)
+        -- and sends them along, because the page the server downloads is a stripped-down version that
+        -- has no Required Items section, and the Steam API does not list them. If the player's game
+        -- could not read them, fall back to the server's own scrape + API lookup.
+        local function LookupRequirements(id, cb)
+            local pre = TBH.Server.ClientReqs[id]
+
+            if pre ~= nil then
+                TBH.Server.ClientReqs[id] = nil
+                TBH.Diag("[server] using the " .. #pre .. " required item(s) the player's game read from the workshop page of " .. id)
+                return cb(pre)
+            end
+
+            TBH.GetRequiredAddons(id, cb)
+        end
+
         local function HandleAddon(id, idTitle, reqs)
             ----------------------------------------------------------------
             -- Listen server fallback: host client downloads for us
@@ -4187,30 +4615,89 @@ if SERVER then
                     return
                 end
 
-                if reqs and TBH.CVarRequirements:GetBool() then
-                    StatusTo(ply, "Note: requirement chains need the gmsv_workshop module - loading the main addon only", 3)
-                end
-
                 if TBH.Server.HostPending[id] then
                     StatusTo(ply, "Already routing that one through the host player", 3)
                     return
                 end
 
-                TBH.Server.HostPending[id] = { requester = ply }
-                StatusTo(ply, "Routing download through the host player (no gmsv_workshop module)...", 0)
+                -- required items: hotload them first (one at a time), then the addon itself
+                if reqs and TBH.CVarRequirements:GetBool() then
+                    StatusTo(ply, "Checking required addons for \"" .. (idTitle or id) .. "\"...", 0)
 
-                timer.Create("TBH.HostWait." .. id, 90, 1, function()
-                    if TBH.Server.HostPending[id] then
-                        TBH.Server.HostPending[id] = nil
-                        TBH.Server.FailedUntil[id] = CurTime() + 60
-                        StatusTo(ply, "Host download of " .. id .. " timed out", 2)
+                    local fired = false
+
+                    local function Proceed(reqIds)
+                        if fired then return end
+                        fired = true
+                        timer.Remove("TBH.ReqTimeout." .. id)
+
+                        local list = {}
+                        for i = 1, #reqIds do
+                            local rid = reqIds[i]
+
+                            if rid ~= id and not AlreadyKnown(rid) and not TBH.Server.HostPending[rid]
+                                and CurTime() >= (TBH.Server.FailedUntil[rid] or 0) then
+                                list[#list + 1] = { wsid = rid, title = "required addon " .. rid, requester = ply }
+                            end
+                        end
+
+                        TBH.Diag("[server] requirements for " .. id .. ": " .. #reqIds .. " found, " .. #list .. " still to load")
+
+                        local function StartChain()
+                            list[#list + 1] = { wsid = id, title = idTitle, requester = ply }
+                            TBH.Server.HostChainAdd(ply, list)
+                        end
+
+                        if #list > 0 then
+                            -- look up the REAL names of the required addons (instead of "required addon <id>")
+                            local ids = {}
+                            for i = 1, #list do ids[#ids + 1] = list[i].wsid end
+
+                            TBH.GetTitlesViaAPI(ids, function(titles)
+                                local names = {}
+
+                                for i = 1, #list do
+                                    local t = titles[list[i].wsid]
+                                    if isstring(t) and t ~= "" then list[i].title = t end
+                                    names[#names + 1] = list[i].title
+                                end
+
+                                StatusTo(ply, "Hotloading " .. #list .. " required addon(s) first: " .. table.concat(names, ", "), 0)
+
+                                -- let the player's game list them under "Your addons this session" right away
+                                if IsValid(ply) then
+                                    TBH.Net:Start("reqlist")
+                                    net.WriteString(id)
+                                    net.WriteString(string_sub(tostring(idTitle or ""), 1, 100))
+                                    net.WriteUInt(math.min(#list, 32), 8)
+                                    for i = 1, math.min(#list, 32) do
+                                        net.WriteString(list[i].wsid)
+                                        net.WriteString(string_sub(tostring(list[i].title or ""), 1, 100))
+                                    end
+                                    net.Send(ply)
+                                end
+
+                                StartChain()
+                            end)
+                        else
+                            if #reqIds == 0 then
+                                StatusTo(ply, "No required addons found on the workshop page", 0)
+                            end
+
+                            StartChain()
+                        end
                     end
-                end)
 
-                TBH.Net:Start("hostdl")
-                net.WriteString(id)
-                net.WriteString(idTitle or "")
-                net.Send(host)
+                    timer.Create("TBH.ReqTimeout." .. id, 20, 1, function()
+                        TBH.Diag("[server] requirement lookup for " .. id .. " timed out - loading the main addon only")
+                        Proceed({})
+                    end)
+
+                    LookupRequirements(id, Proceed)
+                    return
+                end
+
+                TBH.Server.HostChainAdd(ply, { { wsid = id, title = idTitle, requester = ply } })
 
                 return
             end
@@ -4251,7 +4738,7 @@ if SERVER then
                     Proceed({})
                 end)
 
-                TBH.GetRequiredAddons(id, Proceed)
+                LookupRequirements(id, Proceed)
                 return
             end
 
@@ -4275,7 +4762,7 @@ if SERVER then
             -- collections need the server-side downloader - routing 30
             -- members through the host player's client would hammer it with
             -- concurrent downloads, a crash risk we simply refuse
-            if not TBH.ServerCanUGC then
+            if not TBH.ServerCanUGC and not game.SinglePlayer() then
                 TBH.Diag("[server] collection REFUSED: the gmsv_workshop module is not installed")
                 StatusTo(ply, "Collection hotloading needs the gmsv_workshop module (server-side downloads). Install it, or hotload the members individually.", 2)
                 return
@@ -4288,6 +4775,8 @@ if SERVER then
                 local batch = TBH.Server.Batch
                 if (batch and batch.total and batch.total > 0)
                     or TBH.Server.Current ~= nil
+                    or TBH.Server.SP ~= nil
+                    or next(TBH.Server.HostPending) ~= nil
                     or #TBH.Server.Queue > 0 then
                     TBH.Diag("[server] collection REFUSED: another hotload is already running")
                     StatusTo(ply, "A hotload is already running - wait for it to finish before hotloading a collection", 3)
@@ -4304,6 +4793,8 @@ if SERVER then
             end
 
             local queued, skipped = 0, 0
+            local spMode = not TBH.ServerCanUGC -- singleplayer: members go through the host player's game, one by one
+            local spList = {}
 
             for i = 1, #members do
                 local m = members[i]
@@ -4316,7 +4807,13 @@ if SERVER then
                     -- requirement chains (avoids combinatorial explosions)
                     -- and announce quietly (one collection announcement
                     -- instead of 30 chat lines)
-                    Enqueue(m.wsid, m.title, ply, true, true)
+                    if spMode then
+                        m.batch = true
+                        m.requester = ply
+                        spList[#spList + 1] = m
+                    else
+                        Enqueue(m.wsid, m.title, ply, true, true)
+                    end
                     queued = queued + 1
                 end
             end
@@ -4343,7 +4840,14 @@ if SERVER then
                     (skipped > 0 and (" (" .. skipped .. " skipped)") or ""), 3)
             end
 
-            ProcessQueue()
+            if spMode then
+                if queued > 0 then
+                    TBH.Server.SP = { members = spList, idx = 0, requester = ply, current = nil }
+                    TBH.Server.SPBatchNext()
+                end
+            else
+                ProcessQueue()
+            end
         end
 
         -- v1.1.2: the page did not prove this is a collection - get a second
@@ -4535,10 +5039,30 @@ if SERVER then
     -- Net receivers
     --------------------------------------------------------------------
 
+    TBH.Server.ClientReqs = TBH.Server.ClientReqs or {}
+
     TBH.Net:Receive("req", function(len, ply)
         local wsid = net.ReadString()
         local includeReqs = net.ReadBool()
         local titleHint = net.ReadString()
+
+        -- required items the player's game found on the workshop page (ids only, validated)
+        local hasList = net.ReadBool()
+        if hasList then
+            local ids = {}
+            local n = math.min(net.ReadUInt(8), 32)
+
+            for i = 1, n do
+                local id = net.ReadString()
+                if string_match(id, "^%d+$") and #id <= 20 and id ~= wsid then
+                    ids[#ids + 1] = id
+                end
+            end
+
+            TBH.Server.ClientReqs[wsid] = ids
+        else
+            TBH.Server.ClientReqs[wsid] = nil
+        end
 
         TBH.Server.Request(ply, wsid, includeReqs, titleHint)
     end)
@@ -4559,6 +5083,15 @@ if SERVER then
         if TBH.Server.Current == wsid then
             StatusTo(ply, "That addon is being downloaded right now - wait for it to finish", 3)
             return
+        end
+
+        -- a stuck host-route step for this addon must not block the retry
+        if TBH.Server.HostPending[wsid] then
+            TBH.Server.HostPending[wsid] = nil
+            timer.Remove("TBH.HostWait." .. wsid)
+            if TBH.Server.SP and TBH.Server.SP.current == wsid then
+                TBH.Server.SPBatchStepDone(wsid, false)
+            end
         end
 
         -- drop the server's copy (soft unload: hooks, timers, spawnmenu entries)
@@ -4715,6 +5248,7 @@ if SERVER then
             if pending then
                 StatusTo(pending.requester, "Host transfer for " .. wsid .. " was incomplete", 2)
             end
+            TBH.Server.SPBatchStepDone(wsid, false)
             return
         end
 
@@ -4731,6 +5265,7 @@ if SERVER then
             if pending then
                 StatusTo(pending.requester, "Host transfer for " .. wsid .. " was corrupt", 2)
             end
+            TBH.Server.SPBatchStepDone(wsid, false)
             return
         end
 
@@ -4740,6 +5275,7 @@ if SERVER then
             if pending then
                 StatusTo(pending.requester, "Addon has " .. #files .. " files (limit: " .. maxFiles .. ")", 2)
             end
+            TBH.Server.SPBatchStepDone(wsid, false)
             return
         end
 
@@ -4747,12 +5283,13 @@ if SERVER then
 
         local requester = pending and pending.requester or nil
 
-        local okFinalize, errFinalize = pcall(FinalizeMount, wsid, title, files, requester, true)
+        local okFinalize, errFinalize = pcall(FinalizeMount, wsid, title, files, requester, true, pending and pending.spBatch or nil)
         if not okFinalize then
             TBH.LogError("FinalizeMount crashed: " .. tostring(errFinalize))
             if requester then
                 StatusTo(requester, "Hotload of \"" .. title .. "\" crashed during initialization (see server console)", 2)
             end
+            TBH.Server.SPBatchStepDone(wsid, false)
         end
     end)
 
@@ -4769,6 +5306,17 @@ if SERVER then
         if pending then
             StatusTo(pending.requester, "Host download of " .. wsid .. " failed too - the addon itself may be hidden or removed from the Workshop", 2)
         end
+
+        TBH.Server.SPBatchStepDone(wsid, false)
+    end)
+
+    -- singleplayer: the host client finished its own init of a member
+    TBH.Net:Receive("hostclientdone", function(len, ply)
+        if not IsValid(ply) or not ply:IsListenServerHost() then return end
+
+        local wsid = net.ReadString()
+        TBH.Diag("[server] singleplayer: client init of " .. wsid .. " finished")
+        TBH.Server.SPBatchStepDone(wsid, true)
     end)
 
     --------------------------------------------------------------------
@@ -4884,6 +5432,10 @@ if SERVER then
         TBH.Msg("Changing level to " .. mapname .. " (requested by " .. (IsValid(ply) and ply:Nick() or "console") .. ")")
 
         timer.Simple(5, function()
+            -- singleplayer / listen: tell the client side this map change is OURS, so the hotloaded
+            -- addons (the map itself!) are not unmounted like they are when you leave the game
+            pcall(file.Write, "hotloader_keep_mounts.txt", tostring(os.time()))
+
             game.ConsoleCommand("changelevel " .. mapname .. "\n")
 
             -- safety: re-allow after 30s if the changelevel didn't happen
@@ -4904,6 +5456,113 @@ if SERVER then
 
         LoadMap(ply, net.ReadString())
     end)
+
+    --------------------------------------------------------------------
+    -- Game modes: TTT, DarkRP, Prop Hunt, Fazbear Hunt
+    --------------------------------------------------------------------
+
+    local function FindGamemodeFolder(gm)
+        local _, dirs = file.Find("gamemodes/*", "GAME")
+
+        for _, d in ipairs(dirs or {}) do
+            if TBH.MatchGamemode(d) == gm and file.Exists("gamemodes/" .. d .. "/" .. d .. ".txt", "GAME") then
+                return d
+            end
+        end
+
+        return nil
+    end
+
+    -- TTT and DarkRP need their own kind of map; the others just run on the current one
+    local function PickMapFor(gm)
+        local cur = game.GetMap()
+        local prefix = gm.mapPrefix
+
+        if not prefix or prefix == "" or string.sub(cur, 1, #prefix) == prefix then return cur end
+
+        local maps = file.Find("maps/" .. prefix .. "*.bsp", "GAME")
+        if maps and maps[1] then return string.StripExtension(maps[1]) end
+
+        return nil
+    end
+
+    local function SwitchGamemode(ply, what)
+        what = string.lower(string.Trim(tostring(what or "")))
+
+        if what == "" then
+            StatusTo(ply, "Usage: hotloader_gamemode <ttt | darkrp | prophunt | fazbear>", 3)
+            return
+        end
+
+        local gm = TBH.GamemodeByKey[what] or TBH.MatchGamemode(what)
+        if not gm then
+            StatusTo(ply, "Unknown game mode \"" .. what .. "\" - supported: ttt, darkrp, prophunt, fazbear", 2)
+            return
+        end
+
+        local folder = FindGamemodeFolder(gm)
+        if not folder then
+            StatusTo(ply, gm.name .. " is not installed on the server - hotload its addon first", 2)
+            return
+        end
+
+        if string.lower(engine.ActiveGamemode()) == string.lower(folder) then
+            StatusTo(ply, gm.name .. " is already the active game mode", 3)
+            return
+        end
+
+        if mapChangeArmed then
+            StatusTo(ply, "A map change is already in progress...", 3)
+            return
+        end
+
+        local mapname = PickMapFor(gm)
+        if not mapname then
+            StatusTo(ply, gm.name .. " needs a map starting with \"" .. gm.mapPrefix .. "\" and the server has none - hotload a map first", 2)
+            return
+        end
+
+        mapChangeArmed = true
+
+        ChatBroadcast("Switching game mode to " .. gm.name .. " - the map restarts in 5 seconds!", 1)
+        TBH.Msg("Switching game mode to " .. folder .. " on " .. mapname .. " (requested by " .. (IsValid(ply) and ply:Nick() or "console") .. ")")
+
+        timer.Simple(5, function()
+            -- singleplayer / listen: this map change is OURS - the hotloaded addons stay mounted
+            pcall(file.Write, "hotloader_keep_mounts.txt", tostring(os.time()))
+
+            RunConsoleCommand("gamemode", folder)
+            game.ConsoleCommand("changelevel " .. mapname .. "\n")
+
+            timer.Simple(30, function()
+                mapChangeArmed = false
+            end)
+        end)
+    end
+
+    TBH.Net:Receive("gmswitch", function(len, ply)
+        if not IsValid(ply) then return end
+
+        local allowed, reason = CanHotload(ply)
+        if not allowed then
+            StatusTo(ply, "Permission denied: " .. tostring(reason), 2)
+            return
+        end
+
+        SwitchGamemode(ply, net.ReadString())
+    end)
+
+    concommand.Add("hotloader_gamemode", function(ply, cmd, args)
+        if IsValid(ply) then
+            local allowed, reason = CanHotload(ply)
+            if not allowed then
+                StatusTo(ply, "Permission denied: " .. tostring(reason), 2)
+                return
+            end
+        end
+
+        SwitchGamemode(ply, args[1])
+    end, nil, "Switch to a game mode (restarts the map): hotloader_gamemode <ttt|darkrp|prophunt|fazbear>")
 
     concommand.Add("hotloader_loadmap", function(ply, cmd, args)
         local allowed = not IsValid(ply)
@@ -5249,7 +5908,7 @@ if CLIENT then
     ------------------------------------------------------------------------------
 
     TBH.CVarUnloadOnDisconnect = CreateClientConVar("hotloader_unload_on_disconnect", "1", true, false,
-        "Fully unload (Lua + files, needs the gmaunmount module for the files) the addons hotloaded in your previous server session when you join a DIFFERENT server. Map changes on the same server keep them.")
+        "Fully unload (Lua + files, needs the gmaunmount module for the files) the addons hotloaded in your previous session: when you join a DIFFERENT server, when you disconnect, and when you leave singleplayer. Map changes keep them (so do Hotloader LOAD MAP and game mode switches).")
 
     -- you can only be sure a session ended when the server address changes
     -- (a map change on the same server is NOT a disconnect). listen server /
@@ -5305,8 +5964,118 @@ if CLIENT then
         hook.Run("TBH.ClientListChanged")
     end)
 
+    ------------------------------------------------------------------------------
+    -- Leaving SINGLEPLAYER removes everything that was hotloaded
+    --
+    -- A hotloaded addon is only supposed to live for the session. Singleplayer always has the
+    -- same "loopback" address, so the "joined a different server" cleanup above never fired:
+    -- after disconnecting, the files of every hotloaded addon stayed mounted (and their Lua kept
+    -- loading) until the whole game was restarted.
+    --
+    -- Exception: a map change started by Hotloader itself (LOAD MAP) keeps everything, the map
+    -- addon has to stay mounted for the level to load.
+    ------------------------------------------------------------------------------
+
+    local KEEP_FLAG = "hotloader_keep_mounts.txt"
+
+    local function KeepForMapChange()
+        if not file.Exists(KEEP_FLAG, "DATA") then return false end
+
+        local stamp = tonumber(file.Read(KEEP_FLAG, "DATA") or "") or 0
+        return (os.time() - stamp) < 180
+    end
+
+    -- Lua (soft unload) + the mounted files (gmaunmount module) of every hotloaded addon
+    local function UnloadHotloadedSession(reason)
+        local ids = {}
+        for wsid, entry in pairs(TBH.Client.Mounted or {}) do
+            if istable(entry) then ids[#ids + 1] = wsid end
+        end
+
+        if #ids == 0 then return end
+
+        local hasModule = TBH.ProbeGmaUnmount()
+        local luaCount, fileCount = 0, 0
+
+        for _, wsid in ipairs(ids) do
+            local entry = TBH.Client.Mounted[wsid]
+            local bundle = entry and entry.bundle
+
+            if istable(bundle) and isfunction(bundle.Unload) and not entry.unloaded then
+                if pcall(bundle.Unload, bundle, false) then luaCount = luaCount + 1 end
+            end
+
+            if entry then entry.unloaded = true end
+
+            if hasModule then
+                -- the engine can hold several mounts of one addon (e.g. client + listen server copy):
+                -- keep going while the module reports "+N more mount(s)"
+                for _ = 1, 6 do
+                    local ok, done, detail = pcall(gmaunmount.Unmount, tostring(wsid))
+
+                    if (not ok or not done) and TBH.Client.GmaPaths and TBH.Client.GmaPaths[wsid] then
+                        ok, done, detail = pcall(gmaunmount.Unmount, TBH.Client.GmaPaths[wsid])
+                    end
+
+                    if not ok or not done then break end
+                    fileCount = fileCount + 1
+
+                    if not (isstring(detail) and string.find(detail, "more mount", 1, true)) then break end
+                end
+            end
+        end
+
+        TBH.Diag(string.format("[client] %s: unloaded %d hotloaded addon(s) - Lua %d, file mounts removed %d%s",
+            tostring(reason), #ids, luaCount, fileCount, hasModule and "" or " (gmaunmount module missing - files stay mounted)"))
+    end
+
+    -- GAME MODE SAFEGUARD: anything but plain Sandbox gets a notice (once per game mode per session)
+    hook.Add("InitPostEntity", "TBH.GamemodeNotice", function()
+        timer.Simple(8, function()
+            local info = TBH.GetGamemodeInfo()
+            local text = TBH.GamemodeNotice(info)
+
+            TBH.Client.GamemodeNoticed = TBH.Client.GamemodeNoticed or {}
+
+            TBH.Diag("[client] game mode detected: " .. info.folder .. " (" .. info.name .. "), sandbox-based: " .. tostring(info.sandboxBased))
+
+            if not text or TBH.Client.GamemodeNoticed[info.folder] then return end
+            TBH.Client.GamemodeNoticed[info.folder] = true
+
+            MsgC(TBH.Colors.tag, "[Hotloader] ", TBH.Colors.warn, text .. "\n")
+            TBH.NotifyLocally(text, 3, 14)
+        end)
+    end)
+
+    -- disconnect / quit to menu (the Lua state is closing)
+    hook.Add("ShutDown", "TBH.ClientLeaveSession", function()
+        if not TBH.CVarUnloadOnDisconnect:GetBool() then return end
+
+        if game.SinglePlayer() then
+            if KeepForMapChange() then return end
+
+            pcall(UnloadHotloadedSession, "leaving singleplayer")
+        elseif gui and isfunction(gui.IsGameUIVisible) and gui.IsGameUIVisible() then
+            -- MULTIPLAYER: only when YOU leave (menu open: disconnect / quit). A map change the server
+            -- starts (rotation, LOAD MAP, game mode switch) happens with the menu closed and keeps
+            -- everything. If it is ever mistaken for a disconnect, nothing is lost: the server
+            -- re-syncs its hotloaded addons to you when you are back.
+            pcall(UnloadHotloadedSession, "disconnected from the server")
+        end
+    end)
+
     hook.Add("InitPostEntity", "TBH.SessionReset", function()
         TBH.DiagEnd("session reset (map change or (re)spawn)")
+
+        -- safety net for when the shutdown hook did not run: a fresh singleplayer session starts
+        -- clean (a Hotloader LOAD MAP change is the one exception, its flag is consumed here)
+        if game.SinglePlayer() and TBH.CVarUnloadOnDisconnect:GetBool() then
+            if KeepForMapChange() then
+                pcall(file.Delete, KEEP_FLAG)
+            else
+                pcall(UnloadHotloadedSession, "new singleplayer session")
+            end
+        end
 
         local okAddr, addr = pcall(game.GetIPAddress)
         UnloadPreviousSession(okAddr and addr or "?")
@@ -5347,6 +6116,9 @@ if CLIENT then
     local metaQueue = {}      -- ordered wsid pump queue
     local metaPumpActive = false
     local metaRetried = {}    -- [wsid] = true if we've already retried once
+    local metaRefreshed = {}  -- [wsid] = true once the thumbnail was re-checked this session
+    local metaRefresh = {}    -- [wsid] = true while a RE-check (not a first fetch) is in flight
+    local metaAttempts = {}   -- [wsid] = failed attempts so far (retried automatically a few times)
     local imageMatCache = {}  -- [wsid] = cached IMaterial (or nil after a definite failure)
 
     local META_CACHE_FILE = "hotloader_meta_cache.json"
@@ -5929,10 +6701,15 @@ if CLIENT then
 
         local ext = string_match(imgURL, "%.(%w-)%s*$") or "jpg"
 
-        -- already cached on disk? (skip the network entirely)
-        for _, tryExt in ipairs({ ext, "jpg", "png" }) do
-            if (tryExt == "jpg" or tryExt == "png") and file.Exists("hotloader_icons/" .. wsid .. "." .. tryExt, "DATA") then
-                return callback(wsid .. "." .. tryExt)
+        -- The file name carries a hash of the URL. Steam gives an UPDATED thumbnail a new url, so a
+        -- changed icon becomes a new file (and a new material) instead of the stale cached copy
+        -- that used to be reused forever under "<wsid>.jpg".
+        local base = wsid .. "_" .. util.CRC(imgURL)
+
+        -- already downloaded (same url)? skip the network entirely
+        for _, tryExt in ipairs({ "jpg", "png" }) do
+            if file.Exists("hotloader_icons/" .. base .. "." .. tryExt, "DATA") then
+                return callback(base .. "." .. tryExt)
             end
         end
 
@@ -5952,7 +6729,7 @@ if CLIENT then
                 realExt = "png"
             end
 
-            local outFile = wsid .. "." .. realExt
+            local outFile = base .. "." .. realExt
             file.CreateDir("hotloader_icons")
             file.Write("hotloader_icons/" .. outFile, imgBody)
 
@@ -6015,6 +6792,25 @@ if CLIENT then
     local function MetaFail(wsid, reason)
         local meta = TBH.Client.Meta[wsid]
         if not meta then return end
+
+        -- CDN hiccups, rate limits and slow connections are common: retry a few times (10s, 20s, 30s)
+        -- before giving up, instead of leaving a permanent "no preview" / endless "loading preview..."
+        metaAttempts[wsid] = (metaAttempts[wsid] or 0) + 1
+
+        if metaAttempts[wsid] <= 3 and not meta.imageFile then
+            local wait = 10 * metaAttempts[wsid]
+            TBH.Diag("[client] meta failed (" .. tostring(reason) .. ") for wsid " .. tostring(wsid) .. " - retry " .. metaAttempts[wsid] .. "/3 in " .. wait .. "s")
+
+            meta.fetched = nil
+            meta.imageFailed = nil
+            metaFetching[wsid] = nil
+
+            timer.Simple(wait, function()
+                TBH.FetchAddonMeta(wsid)
+            end)
+            return
+        end
+
         meta.imageFailed = true
         meta.fetched = true  -- don't re-queue
         TBH.Diag("[client] meta FAILED (" .. tostring(reason) .. ") for wsid " .. tostring(wsid))
@@ -6033,10 +6829,31 @@ if CLIENT then
 
         metaPumpActive = true
 
+        local finished = false
         local function Done()
+            if finished then return end
+            finished = true
+
             metaPumpActive = false
+            metaFetching[wsid] = nil
+            timer.Remove("TBH.MetaPumpWatch")
             timer.Simple(0.5, MetaPump)
         end
+
+        -- http.Fetch has no timeout: one request that hangs forever used to freeze the whole pump,
+        -- leaving EVERY other thumbnail on "loading preview..." forever. Give up on this one after
+        -- 25s (it is retried automatically) and let the rest go on.
+        timer.Create("TBH.MetaPumpWatch", 25, 1, function()
+            if finished then return end
+
+            TBH.Diag("[client] thumbnail fetch for " .. tostring(wsid) .. " hung for 25s - moving on")
+            MetaFail(wsid, "timed out")
+            Done()
+        end)
+
+        local isRefresh = metaRefresh[wsid] == true
+        metaRefresh[wsid] = nil
+        metaRefreshed[wsid] = true
 
         local meta = TBH.Client.Meta[wsid]
         if not meta then
@@ -6052,7 +6869,9 @@ if CLIENT then
                 meta.imageMaterial = mat
                 meta.fetched = true
                 hook.Run("TBH.ClientListChanged")
-                return Done()
+
+                -- show the cached image right away; a re-check continues below to look for a newer one
+                if not isRefresh then return Done() end
             end
         end
 
@@ -6082,6 +6901,7 @@ if CLIENT then
         --                                     available", never a hang)
         -- ---------------------------------------------------------------
         FetchMetaViaAPI(wsid, function(apiMeta)
+            local oldURL = meta.preview_url
             meta.fetched = true
 
             if istable(apiMeta) then
@@ -6096,11 +6916,28 @@ if CLIENT then
                 end
             end
 
+            -- re-check of a thumbnail we already have: same url = still the current icon
+            if isRefresh and meta.imageFile and oldURL and meta.preview_url == oldURL
+                and file.Exists("hotloader_icons/" .. meta.imageFile, "DATA") then
+                SaveMetaCache()
+                return Done()
+            end
+
             -- commit a downloaded icon file to the meta table (+ persist)
             local function AcceptImage(outFile)
                 if isstring(outFile) and outFile ~= "" then
+                    local oldFile = meta.imageFile
+
                     meta.imageFile = outFile
+                    meta.imageMaterial = nil -- a changed thumbnail has to be loaded again
+                    meta.imageFailed = nil
                     meta._matRetries = nil
+
+                    -- the previous version of the icon is no longer needed
+                    if oldFile and oldFile ~= outFile then
+                        pcall(file.Delete, "hotloader_icons/" .. oldFile)
+                    end
+
                     TBH.Diag("[client] meta icon downloaded OK: " .. tostring(wsid) .. " -> " .. outFile)
                     hook.Run("TBH.ClientListChanged")
                     SaveMetaCache()
@@ -6211,11 +7048,16 @@ if CLIENT then
 
         local meta = TBH.Client.Meta[wsid]
 
+        -- A thumbnail cached in an earlier session is re-checked ONCE per session, so an icon that
+        -- was changed on the Workshop shows up here too (before, the first copy stayed forever).
+        local recheck = meta and meta.fetched and meta.imageFile and not metaRefreshed[wsid]
+
         -- already done (or failed permanently)?
-        if meta and (meta.fetched or meta.imageFailed or meta.failed) then return end
+        if meta and (meta.fetched or meta.imageFailed or meta.failed) and not recheck then return end
         if metaFetching[wsid] then return end
 
         metaFetching[wsid] = true
+        if recheck then metaRefresh[wsid] = true end
         TBH.Client.Meta[wsid] = meta or {}
 
         metaQueue[#metaQueue + 1] = wsid
@@ -6366,6 +7208,19 @@ if CLIENT then
         return string.format("%.1f MB", (bytes or 0) / 1048576)
     end
 
+    -- names + sizes already in cache/workshop when a download starts, so afterwards we
+    -- can tell which file is the one being written right now
+    local function SnapshotWorkshopCache()
+        local snap = {}
+        local names = file.Find("cache/workshop/*", "MOD")
+
+        for i = 1, #names do
+            snap[names[i]] = file.Size("cache/workshop/" .. names[i], "MOD") or 0
+        end
+
+        return snap
+    end
+
     local function LayoutDLToasts()
         local y = 16
         for wsid, t in pairs(TBH.DLToasts) do
@@ -6396,23 +7251,48 @@ if CLIENT then
             panel.Done = false
             panel.Failed = false
 
-            local function Detect()
-                local candidates = {
-                    "cache/workshop/" .. wsid .. ".gma",
-                    "cache/workshop/" .. wsid .. ".cache",
-                    "download/workshop/" .. wsid .. ".gma",
-                }
-                for i = 1, #candidates do
-                    local size = file.Size(candidates[i], "MOD")
-                    if size and size > 0 then return size end
+            panel.Snap = SnapshotWorkshopCache()
+            panel.NextDetect = 0
+            panel.Got = 0
+
+            -- bytes of the download that exist on disk right now (nil if we can't find the file)
+            local function Detect(self)
+                local best
+
+                local function consider(path)
+                    local size = file.Size(path, "MOD")
+                    if size and size > 0 and (not best or size > best) then best = size end
                 end
+
+                -- the file is named after the UGC handle that FileInfo reports
+                if self.FileID then
+                    consider("cache/workshop/" .. self.FileID .. ".cache")
+                    consider("cache/workshop/" .. self.FileID .. ".gma")
+                end
+
+                consider("cache/workshop/" .. wsid .. ".gma")
+                consider("cache/workshop/" .. wsid .. ".cache")
+                consider("download/workshop/" .. wsid .. ".gma")
+
+                -- any file in the cache that is NEW (or growing) since this download started
+                local names = file.Find("cache/workshop/*", "MOD")
+                for i = 1, #names do
+                    local size = file.Size("cache/workshop/" .. names[i], "MOD") or 0
+
+                    if size > 0 and self.Snap[names[i]] ~= size and (not best or size > best) then
+                        best = size
+                    end
+                end
+
+                return best
             end
 
             if steamworks and isfunction(steamworks.FileInfo) then
                 pcall(steamworks.FileInfo, wsid, function(res)
-                    if IsValid(panel) and istable(res) and tonumber(res.size) then
-                        panel.Total = tonumber(res.size)
-                    end
+                    if not (IsValid(panel) and istable(res)) then return end
+
+                    if tonumber(res.size) then panel.Total = tonumber(res.size) end
+                    if isstring(res.fileid) and res.fileid ~= "" then panel.FileID = res.fileid end
                 end)
             end
 
@@ -6420,23 +7300,35 @@ if CLIENT then
                 if self.Done then
                     self.Progress = self.Failed and self.Progress or 1
                 else
-                    local elapsed = SysTime() - self.StartTime
-                    local est
+                    local now = SysTime()
+                    local elapsed = now - self.StartTime
 
-                    local size = Detect()
+                    if now >= self.NextDetect then
+                        self.NextDetect = now + 0.3
+                        local okDetect, size = pcall(Detect, self)
+                        self.LastSize = okDetect and size or nil
+                    end
+
+                    local est
+                    local size = self.LastSize
+
                     if size and self.Total > 0 then
+                        -- real: follow the bytes that are on disk
                         self.Real = true
+                        self.Got = size
                         est = math.min(0.99, size / self.Total)
                     else
-                        -- assume roughly 6 MB/s when we know the size, else 60 s
-                        local expected = (self.Total > 0) and math.max(3, self.Total / (6 * 1048576)) or 60
+                        -- no file to follow: estimate from how fast the previous downloads of this
+                        -- session really were (20 MB/s before the first one has finished)
+                        local speed = TBH.DLSpeed or (20 * 1048576)
+                        local expected = (self.Total > 0) and math.max(2, self.Total / speed) or 40
                         est = math.min(0.95, 1 - math.exp(-2.2 * elapsed / expected))
                     end
 
                     self.Progress = math.max(self.Progress, est)
                 end
 
-                self.Shown = Lerp(FrameTime() * 8, self.Shown, self.Progress)
+                self.Shown = Lerp(FrameTime() * 12, self.Shown, self.Progress)
             end
 
             panel.Paint = function(self, w, h)
@@ -6462,7 +7354,11 @@ if CLIENT then
                 draw.SimpleText(prefix .. pct .. "%", "TBH.Small", w - 16, by + bh / 2, TBH.Colors.text, TEXT_ALIGN_RIGHT, TEXT_ALIGN_CENTER)
 
                 if self.Total > 0 then
-                    draw.SimpleText(FmtMB(self.Total), "TBH.Small", w - 16, 10, TBH.Colors.textdim, TEXT_ALIGN_RIGHT)
+                    local label = FmtMB(self.Total)
+                    if self.Real and not self.Done and (self.Got or 0) > 0 then
+                        label = FmtMB(math.min(self.Got, self.Total)) .. " / " .. label
+                    end
+                    draw.SimpleText(label, "TBH.Small", w - 16, 10, TBH.Colors.textdim, TEXT_ALIGN_RIGHT)
                 end
             end
 
@@ -6480,6 +7376,13 @@ if CLIENT then
         if not IsValid(t) then
             TBH.DLToasts[wsid] = nil
             return
+        end
+
+        -- remember how fast this machine really downloads, for the next bar's estimate
+        local took = SysTime() - (t.StartTime or SysTime())
+        if ok and (t.Total or 0) > 0 and took > 2 then
+            local speed = math.Clamp(t.Total / took, 1048576, 400 * 1048576)
+            TBH.DLSpeed = TBH.DLSpeed and (TBH.DLSpeed * 0.5 + speed * 0.5) or speed
         end
 
         t.Done = true
@@ -6902,6 +7805,11 @@ if CLIENT then
         end
 
         TBH.Client.Mounted[wsid] = nil
+
+        if TBH.Client.HostLoading == wsid and not (TBH.DLToasts and IsValid(TBH.DLToasts[wsid])) then
+            TBH.Client.HostLoading = nil
+        end
+
         TBH.Diag("[client] force reload: dropped our copy of " .. tostring(wsid))
         hook.Run("TBH.ClientListChanged")
     end)
@@ -7349,12 +8257,32 @@ if CLIENT then
             net.WriteString(title)
             net.SendToServer()
 
-            TBH.Client.HostLoading = nil
-            PumpHostRetry()
+            -- singleplayer keeps the slot busy until the client init is completely done,
+            -- so nothing else downloads / rebuilds the spawnmenu in the middle of it
+            if not game.SinglePlayer() then
+                TBH.Client.HostLoading = nil
+                PumpHostRetry()
+            end
+
+            local function FinishHostClient()
+                timer.Remove("TBH.HostGuard." .. wsid)
+
+                if game.SinglePlayer() and TBH.Client.HostLoading == wsid then
+                    TBH.Client.HostLoading = nil
+                end
+
+                -- the server runs hotloads (required addons, collections) one after another and
+                -- waits for this before it starts the next one
+                TBH.Net:Start("hostclientdone")
+                net.WriteString(wsid)
+                net.SendToServer()
+
+                if game.SinglePlayer() then PumpHostRetry() end
+            end
 
             -- give the server a moment to initialize first, then run the
             -- client-side files (mirrors boot order: server before client)
-            timer.Simple(1.5, function()
+            local function RunClientInit()
                 pcall(TBH.ScanConflicts, wsid, title, cleanFiles)
 
                 local okCreate, bundle = pcall(TBH.Bundle.Create, TBH.Bundle, cleanFiles, title)
@@ -7371,6 +8299,7 @@ if CLIENT then
                     }
                     TBH.NotifyLocally("Client init of \"" .. title .. "\" crashed (see console)", 2)
                     hook.Run("TBH.ClientListChanged")
+                    FinishHostClient()
                     return
                 end
 
@@ -7405,6 +8334,7 @@ if CLIENT then
                     end
 
                     hook.Run("TBH.ClientListChanged")
+                    FinishHostClient()
                 end)
 
                 if not okInit then
@@ -7418,16 +8348,120 @@ if CLIENT then
                     }
                     TBH.NotifyLocally("Client init of \"" .. title .. "\" crashed (see console)", 2)
                     hook.Run("TBH.ClientListChanged")
+                    FinishHostClient()
                 end
-            end)
+            end
+
+            if game.SinglePlayer() then
+                -- wait for the SERVER to report that it finished initializing this addon
+                -- ("hostgo"); fall back after 2 minutes so a lost message can't hang it
+                TBH.Client.HostGo = TBH.Client.HostGo or {}
+
+                local fired = false
+                local function Go()
+                    if fired then return end
+                    fired = true
+
+                    timer.Remove("TBH.HostGo." .. wsid)
+                    TBH.Client.HostGo[wsid] = nil
+
+                    timer.Simple(0.5, RunClientInit)
+                end
+
+                TBH.Client.HostGo[wsid] = Go
+                timer.Create("TBH.HostGo." .. wsid, 120, 1, Go)
+
+                -- safety net: never leave the host-download slot stuck busy
+                timer.Create("TBH.HostGuard." .. wsid, 600, 1, function()
+                    if TBH.Client.HostLoading == wsid then
+                        TBH.Client.HostLoading = nil
+                        PumpHostRetry()
+                    end
+                end)
+            else
+                timer.Simple(1.5, RunClientInit)
+            end
         end)
     end
+
+    TBH.Net:Receive("hostgo", function()
+        local wsid = net.ReadString()
+        local go = TBH.Client.HostGo and TBH.Client.HostGo[wsid]
+
+        TBH.Diag("[client] server finished initializing " .. tostring(wsid) .. " - running the client init now")
+
+        if isfunction(go) then go() end
+    end)
+
+    -- the addon you hotloaded contains a supported game mode: ask before restarting the map
+    function TBH.RequestGamemode(what)
+        TBH.Net:Start("gmswitch")
+        net.WriteString(what)
+        net.SendToServer()
+    end
+
+    TBH.Net:Receive("gmfound", function()
+        local folder = net.ReadString()
+        local key = net.ReadString()
+        local name = net.ReadString()
+        local title = net.ReadString()
+
+        TBH.NotifyLocally("\"" .. title .. "\" contains the game mode " .. name, 1, 8)
+
+        Derma_Query(
+            "\"" .. title .. "\" contains the game mode " .. name .. ".\n\n" ..
+            "Garry's Mod can only change game mode by restarting the map.\n" ..
+            "Switch to " .. name .. " now? (everything you hotloaded stays mounted)",
+            "Hotloader - game mode",
+            "Switch now", function() TBH.RequestGamemode(key) end,
+            "Not now", function() end)
+    end)
+
+    -- required addons of something you hotloaded: list them right away, "waiting for their turn"
+    TBH.Net:Receive("reqlist", function()
+        local mainId = net.ReadString()
+        local mainTitle = net.ReadString()
+        local n = net.ReadUInt(8)
+
+        local main = TBH.Client.Known[mainId]
+        local baseTime = (istable(main) and main.time or os.time()) + 1
+        local label = mainTitle ~= "" and mainTitle or mainId
+
+        for i = 1, n do
+            local rid = net.ReadString()
+            local rtitle = net.ReadString()
+
+            if TBH.IsValidWSID(rid) then
+                local k = TBH.Client.Known[rid]
+
+                if not istable(k) then
+                    k = { time = baseTime }
+                    TBH.Client.Known[rid] = k
+                end
+
+                if rtitle ~= "" then k.title = rtitle end
+                k.requiredFor = label
+            end
+        end
+
+        hook.Run("TBH.ClientListChanged")
+    end)
 
     TBH.Net:Receive("hostdl", function()
         local wsid = net.ReadString()
         local titleHint = net.ReadString()
 
         TBH.Diag("[client] server routed a download through us (no gmsv_workshop module): " .. tostring(wsid))
+
+        -- every addon that is hotloaded through this game (required addons, collection members)
+        -- belongs in "Your addons this session" - before, only the one you clicked was listed
+        local known = TBH.Client.Known[wsid]
+        if not istable(known) then
+            TBH.Client.Known[wsid] = { title = titleHint ~= "" and titleHint or wsid, time = os.time() }
+        elseif titleHint ~= "" and (not known.title or known.title == wsid or string.find(known.title, "^required addon")) then
+            known.title = titleHint
+        end
+        hook.Run("TBH.ClientListChanged")
 
         TBH.MarkWatched(wsid)
 
@@ -7500,6 +8534,182 @@ if CLIENT then
         return true
     end
 
+    ------------------------------------------------------------------------------
+    -- REQUIRED ITEMS (read from the real workshop page)
+    --
+    -- The page the SERVER can download is a stripped-down version without the "Required Items"
+    -- box, and the Steam API does not list them either. The game's own browser gets the full
+    -- page, so a hidden browser reads the box and the ids travel to the server with the request.
+    ------------------------------------------------------------------------------
+
+    local REQ_JS = [==[
+    (function () {
+        try {
+            var ids = [];
+
+            function take(root) {
+                var as = root.querySelectorAll('a[href]');
+                for (var i = 0; i < as.length; i++) {
+                    var m = /[?&]id=(\d+)/.exec(as[i].getAttribute('href') || '');
+                    if (m && ids.indexOf(m[1]) < 0) { ids.push(m[1]); }
+                }
+            }
+
+            var box = document.getElementById('RequiredItems') || document.querySelector('.requiredItemsContainer');
+            if (box) { take(box); }
+
+            if (!ids.length) {
+                // no known container: find the "Required items" heading and read the links next to it
+                var heads = document.querySelectorAll('div, span, h1, h2, h3, h4');
+                for (var h = 0; h < heads.length && !ids.length; h++) {
+                    var t = (heads[h].childElementCount === 0 ? (heads[h].textContent || '') : '').trim().toLowerCase();
+                    if (t === 'required items') {
+                        var p = heads[h].parentNode;
+                        for (var up = 0; up < 3 && p && !ids.length; up++) { take(p); p = p.parentNode; }
+                    }
+                }
+            }
+
+            tbhreq.found(ids.join(','));
+        } catch (e) {
+            tbhreq.found('');
+        }
+    })();
+    ]==]
+
+    -- callback(ids)  - ids is a list (possibly empty) or nil when the page could not be read
+    local function ScrapeRequired(wsid, callback)
+        local done = false
+        local panel
+
+        local function Finish(ids)
+            if done then return end
+            done = true
+
+            timer.Remove("TBH.ReqScrape." .. wsid)
+            if IsValid(panel) then panel:Remove() end
+
+            callback(ids)
+        end
+
+        panel = vgui.Create("DHTML")
+        if not IsValid(panel) then return callback(nil) end
+
+        panel:SetSize(320, 240)
+        panel:SetPos(-3000, -3000) -- alive, but off screen
+        panel:SetMouseInputEnabled(false)
+        panel:SetKeyboardInputEnabled(false)
+
+        panel:AddFunction("tbhreq", "found", function(csv)
+            local ids = {}
+            for id in string.gmatch(tostring(csv or ""), "%d+") do
+                if id ~= tostring(wsid) then ids[#ids + 1] = id end
+            end
+            Finish(ids)
+        end)
+
+        panel.OnDocumentReady = function(s, url)
+            -- age gates / redirects: wait for the real item page
+            if not string.find(tostring(url or ""), "filedetails", 1, true) then return end
+            s:RunJavascript(REQ_JS)
+        end
+
+        timer.Create("TBH.ReqScrape." .. wsid, 12, 1, function() Finish(nil) end)
+
+        panel:OpenURL("https://steamcommunity.com/sharedfiles/filedetails/?id=" .. wsid)
+    end
+
+    -- callback(ids) - ordered so that requirements of requirements come first, or nil if none could be read
+    function TBH.LookupRequiredClient(wsid, callback)
+        local ordered, seen, lookups = {}, { [wsid] = true }, 0
+        local finished = false
+
+        local function Done(ok)
+            if finished then return end
+            finished = true
+            timer.Remove("TBH.ReqLookupAll." .. wsid)
+            callback((ok and #ordered > 0) and ordered or nil)
+        end
+
+        -- overall limit so a request can never hang here
+        timer.Create("TBH.ReqLookupAll." .. wsid, 30, 1, function() Done(#ordered > 0) end)
+
+        local function Walk(id, depth, done)
+            lookups = lookups + 1
+
+            ScrapeRequired(id, function(ids)
+                if finished then return end
+                if not ids then return done(false) end
+
+                if depth >= 2 or lookups >= 8 then
+                    for _, rid in ipairs(ids) do
+                        if not seen[rid] then seen[rid] = true ordered[#ordered + 1] = rid end
+                    end
+                    return done(true)
+                end
+
+                local i = 0
+                local function NextChild()
+                    i = i + 1
+                    local rid = ids[i]
+                    if not rid then return done(true) end
+                    if seen[rid] then return NextChild() end
+
+                    seen[rid] = true
+                    Walk(rid, depth + 1, function()
+                        ordered[#ordered + 1] = rid -- its own requirements were added first
+                        NextChild()
+                    end)
+                end
+
+                NextChild()
+            end)
+        end
+
+        Walk(wsid, 0, function(ok) Done(ok) end)
+    end
+
+    -- SAFEGUARD: a request that sits on "requested - waiting for server..." with no download,
+    -- no queue entry and no mount for too long is force-reloaded automatically - exactly what
+    -- right-click -> "Force addon reload" does by hand.
+    local AUTO_FORCE_AFTER = 45  -- seconds without any sign of life
+    local AUTO_FORCE_MAX = 2     -- attempts per request
+
+    timer.Create("TBH.RequestWatchdog", 5, 0, function()
+        local now = os.time()
+
+        for wsid, entry in pairs(TBH.Client.Known) do
+            if istable(entry) and entry.requested and not TBH.Client.Mounted[wsid] then
+                -- anything downloading / mounting right now means the pipeline is busy (a required
+                -- addon or an earlier request is ahead of this one) - not a reason to force anything
+                local alive = TBH.Client.HostLoading ~= nil
+                    or TBH.Client.Current ~= nil
+                    or (TBH.DLToasts and next(TBH.DLToasts) ~= nil)
+
+                if not alive and istable(TBH.Client.Queue) then
+                    for i = 1, #TBH.Client.Queue do
+                        if TBH.Client.Queue[i].wsid == wsid then alive = true break end
+                    end
+                end
+
+                if alive then
+                    entry.time = now -- it is working: restart the clock
+                elseif now - (entry.time or now) >= AUTO_FORCE_AFTER then
+                    entry.autoForce = (entry.autoForce or 0) + 1
+                    entry.time = now
+
+                    if entry.autoForce <= AUTO_FORCE_MAX then
+                        TBH.NotifyLocally("No answer for \"" .. tostring(entry.title or wsid) .. "\" after " .. AUTO_FORCE_AFTER .. "s - forcing an addon reload automatically (" .. entry.autoForce .. "/" .. AUTO_FORCE_MAX .. ")", 3, 6)
+                        TBH.Diag("[client] request watchdog: no answer for " .. tostring(wsid) .. " - auto force reload " .. entry.autoForce)
+                        TBH.RequestForceReload(wsid, entry.title)
+                    elseif entry.autoForce == AUTO_FORCE_MAX + 1 then
+                        TBH.NotifyLocally("Still no answer for \"" .. tostring(entry.title or wsid) .. "\" - check the Activity feed, or right-click it -> Force addon reload", 2, 8)
+                    end
+                end
+            end
+        end
+    end)
+
     function TBH.RequestHotload(input, titleHint, autoLoadMap)
         local wsid = TBH.ExtractWSID(input)
 
@@ -7537,11 +8747,31 @@ if CLIENT then
 
         TBH.NotifyLocally("Requesting hotload of \"" .. (titleHint ~= "" and titleHint or wsid) .. "\"...", 0)
 
-        TBH.Net:Start("req")
-        net.WriteString(wsid)
-        net.WriteBool(true)
-        net.WriteString(string_sub(tostring(titleHint or ""), 1, 100))
-        net.SendToServer()
+        local function SendRequest(reqIds)
+            TBH.Net:Start("req")
+            net.WriteString(wsid)
+            net.WriteBool(true)
+            net.WriteString(string_sub(tostring(titleHint or ""), 1, 100))
+
+            net.WriteBool(istable(reqIds))
+            if istable(reqIds) then
+                local n = math.min(#reqIds, 32)
+                net.WriteUInt(n, 8)
+                for i = 1, n do net.WriteString(reqIds[i]) end
+            end
+
+            net.SendToServer()
+        end
+
+        -- find the Required Items on the real workshop page first (unless the server has them switched off)
+        if TBH.ServerInfo and TBH.ServerInfo.requirements == false then
+            SendRequest(nil)
+        else
+            TBH.LookupRequiredClient(wsid, function(reqIds)
+                TBH.Diag("[client] required items read from the workshop page of " .. wsid .. ": " .. (reqIds and #reqIds or "none / unreadable"))
+                SendRequest(reqIds)
+            end)
+        end
 
         return true
     end
@@ -7616,9 +8846,26 @@ if CLIENT then
     window.__tbhBoys = true;
 
     function report() {
-        try { tbh.url(location.href, document.title || ''); } catch(e) {}
+        var col = false;
+        try { col = isCollectionPage(); } catch(e) {}
+        try { tbh.url(location.href, document.title || '', col); } catch(e) {}
     }
     report();
+
+    // a collection page lists its member addons (and its breadcrumb says "Collections")
+    function isCollectionPage() {
+        try {
+            if (!wsid()) { return false; }
+            if (document.querySelector('.collectionChildren, #collectionChildren, .collectionItems, #collectionItems, .collectionItem')) { return true; }
+            var crumbs = document.querySelectorAll('.breadcrumbs a');
+            for (var i = 0; i < crumbs.length; i++) {
+                var href = crumbs[i].getAttribute('href') || '';
+                var txt = (crumbs[i].textContent || '').trim().toLowerCase();
+                if (/section=collections/i.test(href) || txt === 'collections') { return true; }
+            }
+        } catch(e) {}
+        return false;
+    }
 
     function wsid() {
         var m = (location.href || '').match(/[?&]id=(\d+)/);
@@ -7661,13 +8908,19 @@ if CLIENT then
 
         a.updateLabel = function() {
             var map = isMapPage();
+            var col = !map && isCollectionPage();
             a._tbhMap = map;
+            a._tbhCol = col;
             a.innerHTML = map
                 ? '<span style="font-size:14px">&#128506;</span> LOAD MAP'
-                : '<span style="font-size:14px">&#9889;</span> HOTLOAD';
+                : (col
+                    ? '<span style="font-size:14px">&#9889;</span> HOTLOAD COLLECTION'
+                    : '<span style="font-size:14px">&#9889;</span> HOTLOAD');
             a.title = map
                 ? 'Hotload this map addon and switch the server to it - everyone gets the map'
-                : 'Download and mount this addon instantly with Hotloader';
+                : (col
+                    ? 'Hotload every addon in this collection, one after another'
+                    : 'Download and mount this addon instantly with Hotloader');
         };
         a.updateLabel();
 
@@ -7678,7 +8931,9 @@ if CLIENT then
             if (!id) { flash('No addon id found on this page'); return; }
             var map = a._tbhMap || isMapPage();
             try { tbh.hotload(id, cleanTitle(), map); } catch(e) {}
-            flash(map ? 'Load-map requested! Switch back to the game.' : 'Hotload requested! Switch back to the game.');
+            var colNow = !map && (a._tbhCol || isCollectionPage());
+            flash(map ? 'Load-map requested! Switch back to the game.'
+                : (colNow ? 'Collection hotload requested! Switch back to the game.' : 'Hotload requested! Switch back to the game.'));
         });
         return a;
     }
@@ -8057,6 +9312,7 @@ if CLIENT then
         end
         hotload.DoClick = function() self:HotloadCurrentPage() end
         hotload:DockMargin(4, 0, 0, 0)
+        self.HotloadBtn = hotload
 
         self.URL = vgui.Create("DTextEntry", bar)
         self.URL:Dock(FILL)
@@ -8113,8 +9369,8 @@ if CLIENT then
         self.HTML:Dock(FILL)
 
         pcall(function()
-            self.HTML:AddFunction("tbh", "url", function(url, title)
-                self:OnPageURL(url, title)
+            self.HTML:AddFunction("tbh", "url", function(url, title, isCollection)
+                self:OnPageURL(url, title, isCollection)
             end)
 
             self.HTML:AddFunction("tbh", "hotload", function(id, title, isMap)
@@ -8186,8 +9442,8 @@ if CLIENT then
             end
 
             pcall(function()
-                self.HTML:AddFunction("tbh", "url", function(url, title)
-                    self:OnPageURL(url, title)
+                self.HTML:AddFunction("tbh", "url", function(url, title, isCollection)
+                    self:OnPageURL(url, title, isCollection)
                 end)
 
                 self.HTML:AddFunction("tbh", "hotload", function(id, title, isMap)
@@ -8399,10 +9655,25 @@ if CLIENT then
     -- JS callbacks
     ------------------------------------------------------------------
 
-    function PANEL:OnPageURL(url, title)
+    function PANEL:OnPageURL(url, title, isCollection)
         if isstring(url) and string_match(url, "^https?://") then
             self.CurrentURL = url
             self.URL:SetText(url)
+
+            -- collection pages get a "HOTLOAD COLLECTION" button
+            if IsValid(self.HotloadBtn) then
+                local col = isCollection == true
+
+                if self.IsCollectionPage ~= col then
+                    self.IsCollectionPage = col
+                    self.HotloadBtn:SetText(col and "HOTLOAD COLLECTION" or "HOTLOAD")
+                    self.HotloadBtn:SetWide(col and 190 or 120)
+                    self.HotloadBtn:SetTooltip(col and "Hotload every addon in this collection, one after another" or "Hotload the addon currently open in this page")
+
+                    local parent = self.HotloadBtn:GetParent()
+                    if IsValid(parent) then parent:InvalidateLayout() end
+                end
+            end
 
             if isstring(title) and title ~= "" then
                 self.CurrentTitle = title
@@ -8866,12 +10137,45 @@ if CLIENT then
         ----------------------------------------------------------------
         SectionHeader("ACTIVITY", "what the hotloader is doing right now")
 
-        self.StatusPanel = TopPanel(self, 80)
+        self.StatusPanel = TopPanel(self, 124)
         self.StatusPanel:DockMargin(0, 0, 0, 8)
         self.StatusPanel.Paint = function(_, w, h)
             draw.RoundedBox(6, 0, 0, w, h, TBH.Colors.bgPanel)
-            self:PaintStatus(w, h)
+
+            if #(TBH.StatusLog or {}) == 0 then
+                draw.SimpleText("Nothing yet - paste an addon URL above, or open the Hotloader Browser and go hunting.", "TBH.Status", 12, 14, TBH.Colors.textdim)
+            end
         end
+
+        -- copy button strip (bottom)
+        local copyAll = vgui.Create("DButton", self.StatusPanel)
+        copyAll:Dock(BOTTOM)
+        copyAll:SetTall(20)
+        copyAll:DockMargin(6, 0, 6, 4)
+        copyAll:SetText("")
+        copyAll.Paint = function(s, w, h)
+            local hov = s:IsHovered()
+            draw.SimpleText(hov and "COPY ALL LINES TO CLIPBOARD" or "scroll for older lines  |  click a line to select + Ctrl+C  |  or copy everything",
+                "TBH.Small", w / 2, h / 2, hov and TBH.Colors.tag or TBH.Colors.dim, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+        end
+        copyAll.DoClick = function()
+            local out = {}
+            for _, e in ipairs(TBH.StatusLog or {}) do out[#out + 1] = e.msg or "" end
+            SetClipboardText(table.concat(out, "\n"))
+            if TBH.NotifyLocally then TBH.NotifyLocally("Activity log copied (" .. #out .. " lines)", 1) end
+        end
+
+        -- the scrolling list of lines
+        self.StatusScroll = vgui.Create("DScrollPanel", self.StatusPanel)
+        self.StatusScroll:Dock(FILL)
+        self.StatusScroll:DockMargin(4, 4, 2, 2)
+        self.StatusRows = {}
+
+        local vbar = self.StatusScroll:GetVBar()
+        vbar:SetWide(8)
+        if vbar.SetHideButtons then vbar:SetHideButtons(true) end
+        vbar.Paint = function(_, w, h) draw.RoundedBox(4, 0, 0, w, h, TBH.Colors.bg) end
+        vbar.btnGrip.Paint = function(_, w, h) draw.RoundedBox(4, 0, 0, w, h, TBH.Colors.accent) end
 
         ----------------------------------------------------------------
         -- Session list
@@ -8914,6 +10218,7 @@ if CLIENT then
         hook.Remove("TBH.ClientListChanged", self.RefreshHook)
         hook.Remove("TBH.StatusLogged", self.RefreshHook)
         timer.Remove(self.RefreshHook .. ".Refresh")
+        timer.Remove(self.RefreshHook .. ".Status")
     end
 
     function PANEL:SubmitPin()
@@ -8960,10 +10265,142 @@ if CLIENT then
         end
     end
 
+    -- how many wrapped lines a message needs at a given pixel width
+    local function CountWrappedLines(text, maxW)
+        surface.SetFont("TBH.Status")
+        local spaceW = surface.GetTextSize(" ")
+        local total = 0
+
+        for line in string.gmatch(text .. "\n", "(.-)\n") do
+            local lines, lineW = 1, 0
+
+            for word in string.gmatch(line, "%S+") do
+                local ww = surface.GetTextSize(word)
+
+                if lineW == 0 then
+                    lineW = ww
+                elseif lineW + spaceW + ww <= maxW then
+                    lineW = lineW + spaceW + ww
+                else
+                    lines = lines + 1
+                    lineW = ww
+                end
+
+                while maxW > 30 and lineW > maxW do
+                    lines = lines + 1
+                    lineW = lineW - maxW
+                end
+            end
+
+            total = total + lines
+        end
+
+        return math.max(1, total)
+    end
+
+    -- debounced: collection hotloads log many lines in a burst
     function PANEL:RefreshStatus()
-        -- the paint function reads TBH.StatusLog live; just force repaint
-        if IsValid(self.StatusPanel) then
-            self.StatusPanel:InvalidateLayout(true)
+        if not IsValid(self.StatusScroll) then return end
+
+        timer.Create(self.RefreshHook .. ".Status", 0.1, 1, function()
+            if IsValid(self) then self:RebuildStatus() end
+        end)
+    end
+
+    -- Every log line is a read-only text entry: you can click it, select part of it
+    -- and Ctrl+C. Rows are kept between refreshes (only new lines are added), so a
+    -- selection is not thrown away while the log keeps updating.
+    function PANEL:RebuildStatus()
+        local scroll = self.StatusScroll
+        if not IsValid(scroll) then return end
+
+        local log = TBH.StatusLog or {}
+        local vbar = scroll:GetVBar()
+        local wasAtBottom = vbar:GetScroll() >= (vbar.CanvasSize or 0) - 6
+
+        local alive = {}
+        for _, entry in ipairs(log) do alive[entry] = true end
+
+        for entry, row in pairs(self.StatusRows) do
+            if not alive[entry] then
+                if IsValid(row) then row:Remove() end
+                self.StatusRows[entry] = nil
+            end
+        end
+
+        for _, entry in ipairs(log) do
+            if not self.StatusRows[entry] then
+                local msg = tostring(entry.msg or "")
+                local color = TBH.Colors.text
+                if entry.level == 1 then color = TBH.Colors.ok end
+                if entry.level == 2 then color = TBH.Colors.error end
+                if entry.level == 3 then color = TBH.Colors.warn end
+
+                local row = vgui.Create("DTextEntry")
+                row:SetMultiline(true)
+                row:SetEditable(false)
+                row:SetPaintBackground(false)
+                row:SetFont("TBH.Status")
+                row:SetText(msg)
+                row:SetTall(20)
+
+                -- read-only for real: refuse typed characters, and undo anything else that
+                -- changes the text (backspace / delete / cut / paste / enter) on the spot.
+                -- Selecting and copying keep working.
+                row.AllowInput = function() return true end
+                row.OnChange = function(s)
+                    if s.TBHLock then return end
+                    if s:GetText() ~= msg then
+                        s.TBHLock = true
+                        local caret = s:GetCaretPos()
+                        s:SetText(msg)
+                        s:SetCaretPos(math.min(caret, #msg))
+                        s.TBHLock = false
+                    end
+                end
+
+                scroll:AddItem(row)
+                row:Dock(TOP)
+                row:DockMargin(0, 0, 4, 2)
+
+                local highlight = Color(TBH.Colors.accent.r, TBH.Colors.accent.g, TBH.Colors.accent.b, 110)
+                row.Paint = function(s, w, h)
+                    s:DrawTextEntryText(color, highlight, color)
+                end
+
+                -- size the row to the wrapped text
+                local oldLayout = row.PerformLayout
+                row.PerformLayout = function(s, w, h)
+                    if oldLayout then oldLayout(s, w, h) end
+                    if w > 40 then
+                        local need = CountWrappedLines(msg, w - 12) * 16 + 6
+                        if need ~= h then
+                            s:SetTall(need)
+                            if IsValid(scroll) then scroll:InvalidateLayout() end
+                        end
+                    end
+                end
+
+                -- a text entry swallows the mouse wheel; hand it to the scroll panel
+                row.OnMouseWheeled = function(s, delta)
+                    if IsValid(scroll) then return scroll:OnMouseWheeled(delta) end
+                end
+
+                self.StatusRows[entry] = row
+            end
+        end
+
+        if wasAtBottom then
+            local function ToBottom()
+                if IsValid(scroll) then
+                    scroll:InvalidateLayout(true)
+                    local vb = scroll:GetVBar()
+                    vb:SetScroll(vb.CanvasSize or 0)
+                end
+            end
+
+            timer.Simple(0, ToBottom)
+            timer.Simple(0.15, ToBottom)
         end
     end
 
@@ -9431,6 +10868,12 @@ if CLIENT then
             elseif queued then
                 dotColor = TBH.Colors.info
                 stateText = "downloading..."
+            elseif TBH.Client.HostLoading == selfRow.wsid then
+                dotColor = TBH.Colors.info
+                stateText = "downloading..."
+            elseif istable(TBH.Client.Known[selfRow.wsid]) and TBH.Client.Known[selfRow.wsid].requiredFor then
+                dotColor = TBH.Colors.info
+                stateText = "required by " .. tostring(TBH.Client.Known[selfRow.wsid].requiredFor) .. " - waiting its turn"
             elseif istable(TBH.Client.Known[selfRow.wsid]) and TBH.Client.Known[selfRow.wsid].requested then
                 dotColor = TBH.Colors.info
                 stateText = "requested - waiting for server..."
@@ -12355,7 +13798,7 @@ if CLIENT then
                 self.Extra = extra or ""
                 self.Size = file.Size(info.path, info.id) or 0
 
-                if info.ext == "mdl" then
+                if info.ext == "mdl" and self.Extra == "" then
                     self.Extra = "Models can't be previewed here. Spawn it with the spawnmenu or  'prop_physics' + 'prop_dynamic' console commands:  " .. string_gsub(info.inner or info.path, "^addons/[^/]+/", "")
                 end
             end
@@ -12694,16 +14137,36 @@ if CLIENT then
             thenDo()
         end
 
+        -- A correctly installed legacy addon is  garrysmod/addons/<addon>/models/...  (or /materials/...).
+        -- Anything deeper, like  garrysmod/addons/<folder>/<addon>/models/... , is a NESTED folder:
+        -- the engine never mounts it, so .mdl / .vmt files in there are not supported.
+        local function IsNestedAddonFile(path)
+            path = string.lower(string.gsub(path or "", "\\", "/"))
+
+            local rest = string.match(path, "^addons/[^/]+/(.+)$")
+            if not rest then return false end -- not inside an addon folder (data/, ...)
+
+            return not (string.sub(rest, 1, 7) == "models/" or string.sub(rest, 1, 10) == "materials/")
+        end
+
         function PANEL:OpenFile(e)
             local info = self:InfoFor(e)
             local ext = info.ext
             local FS = TBH.FS
             self.CurrentEntry = e
 
+            -- .mdl / .vmt inside NESTED addon folders are not supported in the Filesystem tab
+            -- (self.Virtual is only set for the Workshop addon content window - never blocked there)
+            local blocked = (not self.Virtual) and (ext == "mdl" or ext == "vmt") and IsNestedAddonFile(info.path)
+
             self:ClearViewer(function()
                 local panel
 
-                if FS.AUDIO_EXT[ext] then
+                if blocked then
+                    panel = vgui.Create("TBH.FSInfo", self.Viewer)
+                    panel:Dock(FILL)
+                    panel:Load(info, ".mdl and .vmt files in NESTED folders are not supported.\n\nThe engine only mounts  garrysmod/addons/<addon>/models/...\nthis one is deeper (addons/<folder>/<addon>/...), so move the addon\nstraight into garrysmod/addons.")
+                elseif FS.AUDIO_EXT[ext] then
                     panel = vgui.Create("TBH.FSAudio", self.Viewer)
                     panel:Dock(FILL)
                     panel.OnStep = function(delta) self:StepAudio(delta) end
@@ -12825,7 +14288,7 @@ if CLIENT then
                     SetClipboardText(self.Virtual and e.path or ("garrysmod/" .. ((self.Root == "data") and "data/" or "") .. e.path))
                 end):SetIcon("icon16/page_copy.png")
 
-                if e.kind == "file" then
+                if e.kind == "file" and (self.Virtual or not ((e.ext == "mdl" or e.ext == "vmt") and IsNestedAddonFile(e.path))) then
                     menu:AddOption("Open as text", function()
                         local info = self:InfoFor(e)
                         self:ClearViewer(function()
@@ -14071,9 +15534,20 @@ if SERVER then
             MsgC(TBH.Colors.text, "        https://github.com/nooshstuff/gmsv_workshop/releases\n")
             MsgC(TBH.Colors.text, "     2. Drop it into garrysmod/lua/bin/ (create the folder)\n")
             MsgC(TBH.Colors.text, "     3. Restart the server (use srcds_run_x64 for 64-bit!)\n")
+        elseif game.SinglePlayer() then
+            MsgC(TBH.Colors.ok, "   gmsv_workshop module: installed (You are In Singleplayer but the module cannot be loaded in singleplayer but everything works)\n")
         else
             MsgC(TBH.Colors.warn, "   gmsv_workshop module: not installed (listen server)\n")
             MsgC(TBH.Colors.text, "   Downloads will be routed through the host player instead.\n")
+        end
+
+        local gmInfo = TBH.GetGamemodeInfo()
+        if gmInfo.pureSandbox then
+            MsgC(TBH.Colors.ok, "   Game mode: sandbox\n")
+        else
+            MsgC(TBH.Colors.warn, "   Game mode: " .. gmInfo.name .. " (" .. gmInfo.folder .. ") - not Sandbox\n")
+            MsgC(TBH.Colors.text, "   Hotloaded weapons/entities/tools only work if this game mode supports them.\n")
+            MsgC(TBH.Colors.text, "   Players without a Q menu open the Hotloader with: hotloader_menu\n")
         end
 
         MsgC(TBH.Colors.text, "   Console: hotloader_hotload <id or url> | hotloader_loadmap | hotloader_list | hotloader_resync | hotloader_wipe | hotloader_pins\n")
